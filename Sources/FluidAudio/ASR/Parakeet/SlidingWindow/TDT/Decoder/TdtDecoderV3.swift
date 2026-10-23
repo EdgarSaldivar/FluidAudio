@@ -127,7 +127,9 @@ internal struct TdtDecoderV3: Sendable {
         // Script-filtering consumes top-K; skip the extraction when the caller
         // didn't provide a language (default path), so v3 joint runs don't pay
         // for K-length array allocations they'll never use.
-        let needsTopK = language != nil
+        // Phrase boosting (TdtConfig.phraseBooster) also re-ranks the top-K candidates.
+        let booster = config.tdtConfig.phraseBooster
+        let needsTopK = language != nil || booster != nil
 
         // Build a stride-aware view so we can access encoder frames without extra copies
         let encoderFrames = try EncoderFrameView(
@@ -192,6 +194,11 @@ internal struct TdtDecoderV3: Sendable {
         let tokenIdBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .int32)
         let tokenProbBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .float32)
         let durationBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .int32)
+
+        // The booster's phrase-trie state continues across windows with the decoder state and
+        // restarts with a fresh one.
+        var boostState =
+            (decoderState.lastToken == nil && decoderState.predictorOutput == nil) ? 0 : decoderState.boostState
 
         // Initialize decoder LSTM state for a fresh utterance
         // This ensures clean state when starting transcription
@@ -298,6 +305,11 @@ internal struct TdtDecoderV3: Sendable {
                     label: &label, score: &score,
                     topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
             }
+            if let booster, label != blankId, let ids = decision.topKIds, let logits = decision.topKLogits {
+                (label, score) = booster.pick(
+                    label: label, probability: score, topKIds: ids, topKLogits: logits, blankId: blankId,
+                    state: boostState)
+            }
 
             // Map duration bin to actual frame count
             // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
@@ -386,6 +398,13 @@ internal struct TdtDecoderV3: Sendable {
                         label: &label, score: &score,
                         topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
                 }
+                if let booster, label != blankId, let ids = innerDecision.topKIds,
+                    let logits = innerDecision.topKLogits
+                {
+                    (label, score) = booster.pick(
+                        label: label, probability: score, topKIds: ids, topKLogits: logits, blankId: blankId,
+                        state: boostState)
+                }
 
                 duration = try TdtDurationMapping.mapDurationBin(
                     innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
@@ -430,6 +449,7 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.suppressedTimestamps.append(emissionTimestamp)
                 }
                 hypothesis.lastToken = label  // Remember for next iteration
+                if let booster { boostState = booster.advance(boostState, label).next }
 
                 // CRITICAL: Update decoder LSTM with the new token
                 // This updates the language model context for better predictions
@@ -599,6 +619,8 @@ internal struct TdtDecoderV3: Sendable {
             decoderState.predictorOutput = nil
             // Keep lastToken for linguistic context - deduplication handles duplicates at higher level
         }
+
+        decoderState.boostState = boostState
 
         // Calculate final timeJump for streaming continuation
         decoderState.timeJump = TdtFrameNavigation.calculateFinalTimeJump(

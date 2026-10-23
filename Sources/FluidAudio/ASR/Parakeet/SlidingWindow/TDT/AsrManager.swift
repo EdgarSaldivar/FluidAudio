@@ -257,7 +257,8 @@ public actor AsrManager {
                 blankId: models.version.blankId,
                 boundarySearchFrames: config.tdtConfig.boundarySearchFrames,
                 maxTokensPerChunk: config.tdtConfig.maxTokensPerChunk,
-                consecutiveBlankLimit: config.tdtConfig.consecutiveBlankLimit
+                consecutiveBlankLimit: config.tdtConfig.consecutiveBlankLimit,
+                phraseBooster: config.tdtConfig.phraseBooster
             )
 
             workingConfig = ASRConfig(

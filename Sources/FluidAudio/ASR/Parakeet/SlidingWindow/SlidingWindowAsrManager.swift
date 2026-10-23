@@ -35,6 +35,20 @@ public actor SlidingWindowAsrManager {
     // accumulatedTokens). Lets per-chunk dedup require temporal adjacency so a
     // coincidental subword-prefix match between far-apart words isn't dropped (#787).
     private var accumulatedTokenTimestamps: [Int] = []
+    // TDT durations and confidences 1:1 with accumulatedTokens, for live gap repair.
+    private var accumulatedDurations: [Int] = []
+    private var accumulatedConfidences: [Float] = []
+    // Live gap repair (`SlidingWindowAsrConfig.gapRepair`): bounded state, O(stretch) work per
+    // window.
+    private var repairProbedGapStarts = Set<Int>()
+    private var repairRing: [Float] = []  // the last ~45 s of audio
+    private var repairRingStart = 0  // absolute sample index of repairRing[0]
+    private var repairReceived = 0  // absolute samples received
+    private var loudness = DecayedLoudness()
+    private var repairScannedFrame = 0  // gaps ending at or before this frame were searched
+    private var repairProbeFrames: [Int] = []  // probe frames inside the rolling budget window
+    /// Gaps re-decoded and tokens inserted by live gap repair since the stream started.
+    public private(set) var gapRepairStats = SlidingWindowGapRepairStats()
     /// The previous window's last word as it was appended to the transcript
     /// text — the vocabulary replacement when rescoring replaced it — so seam
     /// retirement can remove it even when it no longer equals the raw token
@@ -174,6 +188,7 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
+        resetGapRepair()
         lastWindowRenderedLastWord = nil
         failedWindowCount = 0
         lastWindowError = nil
@@ -263,6 +278,10 @@ public actor SlidingWindowAsrManager {
             )
         }
 
+        if config.gapRepair == .streaming {
+            _ = await repairStreaming(upToFrame: Int.max)
+        }
+
         let finalText: String
         if vocabBoostingEnabled {
             // Text-based reconstruction preserves rescored corrections from processWindow().
@@ -310,6 +329,7 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
+        resetGapRepair()
         lastWindowRenderedLastWord = nil
 
         logger.info("SlidingWindowAsrManager reset for source: \(String(describing: self.audioSource))")
@@ -344,6 +364,17 @@ public actor SlidingWindowAsrManager {
     private func appendSamplesAndProcess(_ samples: [Float]) async {
         // Append samples to buffer
         sampleBuffer.append(contentsOf: samples)
+        if config.gapRepair == .streaming {
+            repairRing.append(contentsOf: samples)
+            repairReceived += samples.count
+            loudness.add(samples)
+            let cap = Self.repairRingSamples
+            if repairRing.count > cap + 160_000 {  // trim in 10 s steps (amortized O(1))
+                let drop = repairRing.count - cap
+                repairRing.removeFirst(drop)
+                repairRingStart += drop
+            }
+        }
 
         // Process while we have at least chunk + right ahead of the current center start
         let chunk = config.chunkSamples
@@ -460,7 +491,7 @@ public actor SlidingWindowAsrManager {
             // Update stored decoder state
             self.decoderState = state
 
-            let (tokens, timestamps, confidences, _, droppedPreviousTokens) = result
+            let (tokens, timestamps, confidences, _, droppedPreviousTokens, durations) = result
 
             // The window re-decoded the previous window's last word in full (#897):
             // retire that word from the accumulated tokens and from the text state.
@@ -468,6 +499,8 @@ public actor SlidingWindowAsrManager {
                 let dropped = Array(accumulatedTokens.suffix(droppedPreviousTokens))
                 accumulatedTokens.removeLast(droppedPreviousTokens)
                 accumulatedTokenTimestamps.removeLast(min(droppedPreviousTokens, accumulatedTokenTimestamps.count))
+                accumulatedDurations.removeLast(min(droppedPreviousTokens, accumulatedDurations.count))
+                accumulatedConfidences.removeLast(min(droppedPreviousTokens, accumulatedConfidences.count))
                 if let droppedText = await asrManager?.convertTokensToText(dropped), !droppedText.isEmpty {
                     // The text state may hold a vocabulary-rescored replacement
                     // for that word rather than its raw token text.
@@ -519,7 +552,18 @@ public actor SlidingWindowAsrManager {
                         contentsOf: Array(repeating: -1, count: tokens.count - adjustedTimestamps.count))
                 }
             }
+            accumulatedDurations.append(
+                contentsOf: durations.count == tokens.count ? durations : Array(repeating: 1, count: tokens.count))
+            accumulatedConfidences.append(
+                contentsOf: confidences.count == tokens.count ? confidences : Array(repeating: 0, count: tokens.count))
             lastProcessedFrame = max(lastProcessedFrame, adjustedTimestamps.max() ?? 0)
+            var repairedTimings: [TokenTiming] = []
+            if config.gapRepair == .streaming && !isLastChunk {
+                // Tokens before this window's start are final (the next window re-decodes at most
+                // this window's last word): repair the gaps that end there.
+                repairedTimings = await repairStreaming(
+                    upToFrame: windowStartSample / ASRConstants.samplesPerEncoderFrame)
+            }
             segmentIndex += 1
             processedChunks += 1
 
@@ -580,7 +624,8 @@ public actor SlidingWindowAsrManager {
                 tokenIds: tokens,
                 tokenTimings: displayResult.tokenTimings ?? [],
                 ctcDetectedTerms: displayResult.ctcDetectedTerms,
-                ctcAppliedTerms: displayResult.ctcAppliedTerms
+                ctcAppliedTerms: displayResult.ctcAppliedTerms,
+                repairedTokenTimings: repairedTimings
             )
 
             updateContinuation?.yield(update)
@@ -785,6 +830,11 @@ public struct SlidingWindowAsrConfig: Sendable {
     /// tdtJa models (same behavior as the batch API).
     public let language: Language?
 
+    /// Live seam-gap repair: `.off` (FluidAudio's behaviour) or `.streaming`, which re-decodes,
+    /// with fresh context, each finalized stretch of at least `seamGapRepairMinGapSeconds` that has
+    /// speech but no words, as the batch `ChunkProcessor.repairSeamGaps` does per file.
+    public let gapRepair: SlidingWindowGapRepair
+
     /// Default configuration using the proven 11+2+2 window layout.
     /// The assembled window (left + chunk + right) must fit the model's fixed
     /// 15 s input (`ASRConstants.maxModelSamples`); 2 + 11 + 2 = 15 s fits exactly.
@@ -817,7 +867,8 @@ public struct SlidingWindowAsrConfig: Sendable {
         minContextForConfirmation: TimeInterval = 10.0,
         confirmationThreshold: Double = 0.85,
         tdtConfig: TdtConfig? = nil,
-        language: Language? = nil
+        language: Language? = nil,
+        gapRepair: SlidingWindowGapRepair = .off
     ) {
         self.chunkSeconds = chunkSeconds
         self.hypothesisChunkSeconds = hypothesisChunkSeconds
@@ -827,6 +878,7 @@ public struct SlidingWindowAsrConfig: Sendable {
         self.confirmationThreshold = confirmationThreshold
         self.tdtConfig = tdtConfig
         self.language = language
+        self.gapRepair = gapRepair
     }
 
     /// Returns a copy of this config with the given TDT configuration applied.
@@ -839,7 +891,8 @@ public struct SlidingWindowAsrConfig: Sendable {
             minContextForConfirmation: minContextForConfirmation,
             confirmationThreshold: confirmationThreshold,
             tdtConfig: tdtConfig,
-            language: language
+            language: language,
+            gapRepair: gapRepair
         )
     }
 
@@ -853,7 +906,23 @@ public struct SlidingWindowAsrConfig: Sendable {
             minContextForConfirmation: minContextForConfirmation,
             confirmationThreshold: confirmationThreshold,
             tdtConfig: tdtConfig,
-            language: language
+            language: language,
+            gapRepair: gapRepair
+        )
+    }
+
+    /// Returns a copy of this config with the given live gap repair mode.
+    public func applying(gapRepair: SlidingWindowGapRepair) -> SlidingWindowAsrConfig {
+        SlidingWindowAsrConfig(
+            chunkSeconds: chunkSeconds,
+            hypothesisChunkSeconds: hypothesisChunkSeconds,
+            leftContextSeconds: leftContextSeconds,
+            rightContextSeconds: rightContextSeconds,
+            minContextForConfirmation: minContextForConfirmation,
+            confirmationThreshold: confirmationThreshold,
+            tdtConfig: tdtConfig,
+            language: language,
+            gapRepair: gapRepair
         )
     }
 
@@ -959,6 +1028,10 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
     public let ctcDetectedTerms: [String]?
     /// Vocabulary terms applied as replacements in this window's text.
     public let ctcAppliedTerms: [String]?
+    /// Tokens live gap repair (`SlidingWindowAsrConfig.gapRepair`) inserted into stretches that
+    /// earlier updates already delivered, on the stream's clock and in time order. They are not in
+    /// `tokenTimings` or `text`; `finish()`'s merged text includes them. Empty without repair.
+    public let repairedTokenTimings: [TokenTiming]
 
     public init(
         text: String,
@@ -968,7 +1041,8 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         tokenIds: [Int] = [],
         tokenTimings: [TokenTiming] = [],
         ctcDetectedTerms: [String]? = nil,
-        ctcAppliedTerms: [String]? = nil
+        ctcAppliedTerms: [String]? = nil,
+        repairedTokenTimings: [TokenTiming] = []
     ) {
         self.text = text
         self.isConfirmed = isConfirmed
@@ -978,5 +1052,220 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         self.tokenTimings = tokenTimings
         self.ctcDetectedTerms = ctcDetectedTerms
         self.ctcAppliedTerms = ctcAppliedTerms
+        self.repairedTokenTimings = repairedTokenTimings
+    }
+}
+
+// MARK: - Live seam-gap repair
+
+/// Live seam-gap repair mode for `SlidingWindowAsrManager`.
+public enum SlidingWindowGapRepair: Sendable, Equatable {
+    /// No repair (FluidAudio's default).
+    case off
+    /// After each window, re-decode the newly finalized gaps (bounded memory and work).
+    case streaming
+}
+
+/// Counters of live gap repair over one stream.
+public struct SlidingWindowGapRepairStats: Sendable, Equatable {
+    /// Gaps re-decoded.
+    public var probes = 0
+    /// Tokens inserted into the transcript.
+    public var insertedTokens = 0
+    public init() {}
+}
+
+/// Running 75th percentile of per-frame (80 ms) RMS over non-digital-silence frames, on a log
+/// histogram with exponential forgetting (half-life `halfLifeFrames`), for FluidAudio's adaptive
+/// speech gate without keeping the stream.
+struct DecayedLoudness {
+    static let bins = 320
+    static let lo: Double = -6.0, step: Double = 0.02  // log10(rms) from 1e-6 upwards
+    static let halfLifeFrames = 7_500.0  // 10 minutes
+    var hist = [Double](repeating: 0, count: bins)
+    var weight = 1.0
+    var total = 0.0
+    var pending: [Float] = []
+
+    mutating func add(_ samples: [Float]) {
+        pending.append(contentsOf: samples)
+        let f = ASRConstants.samplesPerEncoderFrame
+        var o = 0
+        let grow = pow(2.0, 1.0 / Self.halfLifeFrames)
+        while o + f <= pending.count {
+            var sum: Float = 0
+            for i in o..<(o + f) { sum += pending[i] * pending[i] }
+            o += f
+            guard sum > 0 else { continue }
+            let rms = Double(sqrt(sum / Float(f)))
+            let b = min(Self.bins - 1, max(0, Int((log10(rms) - Self.lo) / Self.step)))
+            weight *= grow
+            hist[b] += weight
+            total += weight
+            if weight > 1e12 {  // renormalize
+                for i in 0..<Self.bins { hist[i] /= weight }
+                total /= weight
+                weight = 1.0
+            }
+        }
+        pending.removeFirst(o)
+    }
+
+    /// FluidAudio's adaptive threshold from the running reference percentile.
+    var threshold: Float {
+        guard total > 0 else { return ChunkProcessor.speechRmsCeiling }
+        let target = total * ChunkProcessor.speechRmsReferencePercentile
+        var acc = 0.0
+        var bin = Self.bins - 1
+        for i in 0..<Self.bins {
+            acc += hist[i]
+            if acc > target {
+                bin = i
+                break
+            }
+        }
+        let reference = Float(pow(10, Self.lo + (Double(bin) + 0.5) * Self.step))
+        return ChunkProcessor.adaptiveSpeechRmsThreshold(
+            referenceRms: reference, floor: ChunkProcessor.speechRmsFloor, ceiling: ChunkProcessor.speechRmsCeiling)
+    }
+}
+
+extension SlidingWindowAsrManager {
+    static let repairRingSamples = 45 * 16_000
+    static let repairBudgetFrames = 7_500  // 32 probes per rolling 10 minutes
+
+    fileprivate func resetGapRepair() {
+        accumulatedDurations.removeAll()
+        accumulatedConfidences.removeAll()
+        repairProbedGapStarts.removeAll()
+        repairRing.removeAll()
+        repairRingStart = 0
+        repairReceived = 0
+        loudness = DecayedLoudness()
+        repairScannedFrame = 0
+        repairProbeFrames.removeAll()
+        gapRepairStats = SlidingWindowGapRepairStats()
+    }
+
+    /// FluidAudio's seam-gap repair (`ChunkProcessor.repairSeamGaps`, #758, with its constants:
+    /// gaps of at least `seamGapRepairMinGapSeconds` holding at least 0.5 s of speech under the
+    /// adaptive loudness gate, two window placements, three passes, 32 probes) with bounded work
+    /// for a live stream: only gaps that end after the last searched frame and at or before
+    /// `upToFrame` are probed, on audio from a ~45 s ring buffer, with a running loudness
+    /// percentile and a rolling probe budget (32 per 10 minutes). Token arrays are touched only
+    /// from the searched stretch onward. Returns the inserted tokens with their times.
+    fileprivate func repairStreaming(upToFrame: Int) async -> [TokenTiming] {
+        guard let mgr = asrManager, accumulatedTokens.count >= 2 else { return [] }
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let ringEnd = repairRingStart + repairRing.count
+        let vocabulary = await mgr.vocabulary
+        let safeIds = ChunkProcessor.spliceSafeTokenIds(vocabulary: vocabulary)
+        let minGapFrames = max(2, Int(await mgr.seamGapRepairMinGapSeconds / ASRConstants.secondsPerEncoderFrame))
+        let windowSamples = max(
+            frameSamples, (ASRConstants.maxModelSamples - ASRConstants.melHopSize) / frameSamples * frameSamples)
+        let layers = await mgr.decoderLayerCount
+        let threshold = loudness.threshold
+        let from = repairScannedFrame
+        let limit = upToFrame == Int.max ? ringEnd / frameSamples + 1 : upToFrame
+        defer { repairScannedFrame = max(repairScannedFrame, limit) }
+        func ringSpeechSeconds(_ a: Int, _ b: Int) -> Double? {
+            guard a >= repairRingStart, b <= ringEnd else { return nil }
+            var frames = 0
+            var o = a
+            while o + frameSamples <= b {
+                var sum: Float = 0
+                let base = o - repairRingStart
+                for i in base..<(base + frameSamples) { sum += repairRing[i] * repairRing[i] }
+                if sqrt(sum / Float(frameSamples)) > threshold { frames += 1 }
+                o += frameSamples
+            }
+            return Double(frames) * ASRConstants.secondsPerEncoderFrame
+        }
+        // First token whose following gap can end after `from`: binary search on the timestamps.
+        var lo = 0
+        var hi = accumulatedTokenTimestamps.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if accumulatedTokenTimestamps[mid] < from { lo = mid + 1 } else { hi = mid }
+        }
+        let tailStart = max(0, lo - 1)
+        var insertedAll: [ChunkProcessor.TokenWindow] = []
+        for _ in 0..<3 {
+            let working: [ChunkProcessor.TokenWindow] = (tailStart..<accumulatedTokens.count).map {
+                (
+                    token: accumulatedTokens[$0], timestamp: accumulatedTokenTimestamps[$0],
+                    confidence: accumulatedConfidences[$0], duration: accumulatedDurations[$0]
+                )
+            }
+            guard working.count >= 2 else { break }
+            var inserts: [ChunkProcessor.TokenWindow] = []
+            for index in 0..<(working.count - 1) {
+                let current = working[index]
+                let next = working[index + 1]
+                let gapStart = current.timestamp + max(1, current.duration)
+                let gapEnd = next.timestamp
+                guard gapEnd > from, gapEnd <= limit, gapEnd - gapStart >= minGapFrames,
+                    !repairProbedGapStarts.contains(gapStart)
+                else { continue }
+                repairProbeFrames.removeAll { $0 < gapEnd - Self.repairBudgetFrames }
+                guard repairProbeFrames.count < 32 else { break }
+                let gapStartSample = gapStart * frameSamples
+                let gapEndSample = min(gapEnd * frameSamples, repairReceived)
+                guard gapEndSample > gapStartSample,
+                    let speech = ringSpeechSeconds(gapStartSample, gapEndSample), speech >= 0.5
+                else { continue }
+                repairProbedGapStarts.insert(gapStart)
+                repairProbeFrames.append(gapEnd)
+                gapRepairStats.probes += 1
+                let center = (gapStartSample + gapEndSample) / 2
+                for placement in [gapStartSample, center - windowSamples / 2] {
+                    var windowStart = max(repairRingStart, min(placement, ringEnd - windowSamples))
+                    windowStart = (windowStart + frameSamples - 1) / frameSamples * frameSamples
+                    let windowEnd = min(windowStart + windowSamples, ringEnd)
+                    guard windowEnd > windowStart, windowStart >= repairRingStart else { continue }
+                    var state = TdtDecoderState.make(decoderLayers: layers)
+                    state.reset()
+                    let audio = Array(repairRing[(windowStart - repairRingStart)..<(windowEnd - repairRingStart)])
+                    guard
+                        let (tokens, timestamps, confidences, durations) = try? await ChunkProcessor.transcribeChunk(
+                            samples: audio, contextSamples: 0, chunkStart: windowStart,
+                            isLastChunk: windowEnd >= repairReceived, using: mgr, decoderState: &state,
+                            maxModelSamples: ASRConstants.maxModelSamples, language: config.language),
+                        tokens.count == timestamps.count, tokens.count == confidences.count
+                    else { continue }
+                    let candidate = ChunkProcessor.spliceCandidate(
+                        windowTokens: tokens, windowTimestamps: timestamps, windowConfidences: confidences,
+                        windowDurations: durations.count == tokens.count
+                            ? durations : Array(repeating: 0, count: tokens.count),
+                        gapStartFrame: gapStart, gapEndFrame: gapEnd,
+                        leadNeighbor: ChunkProcessor.wordNeighbor(
+                            in: working, from: index, step: -1, vocabulary: vocabulary),
+                        tailNeighbor: ChunkProcessor.wordNeighbor(
+                            in: working, from: index + 1, step: 1, vocabulary: vocabulary),
+                        spliceSafeTokenIds: safeIds, vocabulary: vocabulary)
+                    if !candidate.isEmpty {
+                        inserts.append(contentsOf: candidate)
+                        break
+                    }
+                }
+            }
+            guard !inserts.isEmpty else { break }
+            gapRepairStats.insertedTokens += inserts.count
+            insertedAll.append(contentsOf: inserts)
+            let merged = (working + inserts).enumerated()
+                .sorted { ($0.element.timestamp, $0.offset) < ($1.element.timestamp, $1.offset) }.map(\.element)
+            let range = tailStart..<accumulatedTokens.count
+            accumulatedTokens.replaceSubrange(range, with: merged.map(\.token))
+            accumulatedTokenTimestamps.replaceSubrange(range, with: merged.map(\.timestamp))
+            accumulatedConfidences.replaceSubrange(range, with: merged.map(\.confidence))
+            accumulatedDurations.replaceSubrange(range, with: merged.map(\.duration))
+        }
+        let frame = ASRConstants.secondsPerEncoderFrame
+        return insertedAll.sorted { $0.timestamp < $1.timestamp }.map { token in
+            let start = Double(token.timestamp) * frame
+            return TokenTiming(
+                token: vocabulary[token.token] ?? "", tokenId: token.token, startTime: start,
+                endTime: start + Double(max(1, token.duration)) * frame, confidence: token.confidence)
+        }
     }
 }

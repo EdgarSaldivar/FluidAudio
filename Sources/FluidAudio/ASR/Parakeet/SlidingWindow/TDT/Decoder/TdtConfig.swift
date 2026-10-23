@@ -6,6 +6,10 @@ public struct TdtConfig: Sendable {
     public let boundarySearchFrames: Int
     public let maxTokensPerChunk: Int
     public let consecutiveBlankLimit: Int
+    /// Optional glossary phrase boosting inside the decode loop (`TdtPhraseBooster`). It needs a
+    /// joint that emits top-K candidates (`top_k_ids`, `top_k_logits`); a joint without them
+    /// decodes unboosted.
+    public let phraseBooster: TdtPhraseBooster?
 
     public static let `default` = TdtConfig()
 
@@ -22,7 +26,8 @@ public struct TdtConfig: Sendable {
         // Increased to 150 for 11.2s center chunks (~40 words * 2-3 tokens/word + buffer)
         maxTokensPerChunk: Int = 150,
         // Number of consecutive blanks to trigger early termination in last chunk
-        consecutiveBlankLimit: Int = 5
+        consecutiveBlankLimit: Int = 5,
+        phraseBooster: TdtPhraseBooster? = nil
     ) {
         self.includeTokenDuration = includeTokenDuration
         self.maxSymbolsPerStep = maxSymbolsPerStep
@@ -31,5 +36,6 @@ public struct TdtConfig: Sendable {
         self.boundarySearchFrames = boundarySearchFrames
         self.maxTokensPerChunk = maxTokensPerChunk
         self.consecutiveBlankLimit = consecutiveBlankLimit
+        self.phraseBooster = phraseBooster
     }
 }

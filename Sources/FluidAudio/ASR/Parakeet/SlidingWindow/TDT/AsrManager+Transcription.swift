@@ -443,7 +443,7 @@ extension AsrManager {
         language: Language? = nil
     ) async throws -> (
         tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int,
-        droppedPreviousTokens: Int
+        droppedPreviousTokens: Int, durations: [Int]
     ) {
         let (alignedSamples, frameAlignedLength) = frameAlignedAudio(
             chunkSamples, allowAlignment: previousTokens.isEmpty)
@@ -553,10 +553,15 @@ extension AsrManager {
                 removedCount > 0
                 ? Array(currentConfidences.dropFirst(removedCount)) : currentConfidences
 
-            return (deduped, adjustedTimestamps, adjustedConfidences, encLen, droppedPrevious)
+            // TDT durations (encoder frames) of the tokens kept, 1:1 with them.
+            let keptDurations = Array(hypothesis.tokenDurations.suffix(deduped.count))
+            return (deduped, adjustedTimestamps, adjustedConfidences, encLen, droppedPrevious, keptDurations)
         }
 
-        return (currentTokens, currentTimestamps, currentConfidences, encLen, droppedPrevious)
+        return (
+            currentTokens, currentTimestamps, currentConfidences, encLen, droppedPrevious,
+            Array(hypothesis.tokenDurations.suffix(currentTokens.count))
+        )
     }
 
     internal func processTranscriptionResult(

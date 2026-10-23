@@ -69,7 +69,8 @@ internal struct TdtDecoderV2 {
             blankId: 1024,
             boundarySearchFrames: tdt.boundarySearchFrames,
             maxTokensPerChunk: tdt.maxTokensPerChunk,
-            consecutiveBlankLimit: tdt.consecutiveBlankLimit
+            consecutiveBlankLimit: tdt.consecutiveBlankLimit,
+            phraseBooster: tdt.phraseBooster
         )
 
         return ASRConfig(
